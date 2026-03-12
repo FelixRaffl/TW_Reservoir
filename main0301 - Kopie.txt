@@ -1,0 +1,228 @@
+import threading, subprocess, json, time, sys
+
+# ----------------- Einstellungen -----------------
+POLL_INTERVAL_S   = 0.05
+DEBOUNCE_S        = 0.1  # Increased to 100ms for better stability
+API_TIMEOUT_S     = 0.5
+SMS_TIMEOUT_S     = 5.0  # Increased slightly for modem reliability
+DOOR_DELAY_S      = 120
+ACTIVE_LOW        = True
+
+NUMBERS = ["+393894442477", "+393479539469"]
+
+# ----------------- ACL SMS SETTINGS -----------------
+ACL1_LOW_THRESHOLD    = 80
+ACL1_RESET_THRESHOLD  = 85
+ACL1_TIME_DELAY       = 300  # 5 minutes
+
+ACL2_LOW_THRESHOLD    = 60
+ACL2_RESET_THRESHOLD  = 65
+ACL2_TIME_DELAY       = 300  # 5 minutes
+
+# Threading Lock for shared state safety
+state_lock = threading.Lock()
+
+# Level states
+acl1_start_time = None
+acl1_sms_sent   = False
+acl2_start_time = None
+acl2_sms_sent   = False
+
+# ----------------- Zustände -----------------
+prev_dwi0 = None
+prev_dwi1 = None
+taster3_flag = False
+send_sms_door = False
+door_timer = None
+door_start_time = None 
+last_read_time = {"dwi0": 0.0, "dwi1": 0.0}
+last_read_val  = {"dwi0": None, "dwi1": None}
+last_acl_print = 0.0
+
+# ----------------- API Helpers -----------------
+def run_json(cmd, timeout):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout)
+    except:
+        return None
+
+def get_acl_percent():
+    resp = run_json(["/sbin/api", "GET", "/io/acl0/status"], API_TIMEOUT_S)
+    if resp:
+        return resp.get("http_body", {}).get("data", {}).get("percent", None)
+    return None
+
+def get_dwi_value(io_id):
+    now = time.monotonic()
+    if now - last_read_time[io_id] < DEBOUNCE_S and last_read_val[io_id] is not None:
+        return last_read_val[io_id]
+
+    resp = run_json(["/sbin/api", "GET", f"/io/{io_id}/status"], API_TIMEOUT_S)
+    if resp:
+        try:
+            raw = int(resp["http_body"]["data"]["value"])
+            val = not bool(raw) if ACTIVE_LOW else bool(raw)
+            last_read_time[io_id] = now
+            last_read_val[io_id] = val
+            return val
+        except:
+            return last_read_val[io_id]
+    return last_read_val[io_id]
+
+def send_sms(number, text):
+    payload = {"number": number, "text": text, "validate": False, "async": False}
+    try:
+        # Use a slightly longer timeout for the actual shell command
+        subprocess.run(
+            ["ubus", "call", "gsm.modem0", "send_sms", json.dumps(payload)],
+            capture_output=True, text=True, timeout=SMS_TIMEOUT_S
+        )
+        print(f"[SMS] Sent to {number}")
+    except Exception as e:
+        print(f"[ERR] SMS failed to {number}: {e}")
+
+# ----------------- DOOR TIMER -----------------
+def schedule_door_timer():
+    global door_timer, taster3_flag, door_start_time
+    
+    with state_lock:
+        taster3_flag = False
+        door_start_time = time.monotonic()
+
+        if door_timer is not None:
+            door_timer.cancel()
+
+        door_timer = threading.Timer(DOOR_DELAY_S, door_timer_elapsed)
+        door_timer.daemon = True
+        door_timer.start()
+        print(f"\n[EVENT] Door opened! {DOOR_DELAY_S}s timer started.")
+
+def door_timer_elapsed():
+    global send_sms_door, taster3_flag, door_start_time
+    with state_lock:
+        door_start_time = None
+        if not taster3_flag:
+            send_sms_door = True
+            print("[ALARM] No acknowledgment! Flagging SMS for main loop.")
+        else:
+            print("[INFO] Door acknowledged correctly.")
+
+# ----------------- ACL ALERT LOGIC -----------------
+def check_acl_alert(percent):
+    global acl1_start_time, acl1_sms_sent, acl2_start_time, acl2_sms_sent
+    try:
+        if percent is None: return
+        p_val = int(float(percent))
+    except: return
+
+    now = time.monotonic()
+
+    # LEVEL 2 (60%)
+    if p_val >= ACL2_RESET_THRESHOLD:
+        acl2_start_time = None
+        acl2_sms_sent = False
+    elif p_val < ACL2_LOW_THRESHOLD:
+        if acl2_start_time is None:
+            acl2_start_time = now
+        elif not acl2_sms_sent and (now - acl2_start_time >= ACL2_TIME_DELAY):
+            for num in NUMBERS:
+                send_sms(num, "Wasserstand Reservoir Ungericht unter 60%")
+            acl2_sms_sent = True
+        return # Skip level 1 if level 2 is active
+
+    # LEVEL 1 (80%)
+    if p_val >= ACL1_RESET_THRESHOLD:
+        acl1_start_time = None
+        acl1_sms_sent = False
+    elif p_val < ACL1_LOW_THRESHOLD:
+        if acl1_start_time is None:
+            acl1_start_time = now
+        elif not acl1_sms_sent and (now - acl1_start_time >= ACL1_TIME_DELAY):
+            for num in NUMBERS:
+                send_sms(num, "Wasserstand Reservoir Ungericht unter 80%")
+            acl1_sms_sent = True
+
+# ----------------- MAIN LOOP -----------------
+def main():
+    global prev_dwi0, prev_dwi1, send_sms_door, last_acl_print, taster3_flag
+    last_debug_print = 0.0
+
+    print("System active. Monitoring inputs...")
+    try:
+        while True:
+            now = time.monotonic()
+            dwi0 = get_dwi_value("dwi0")
+            dwi1 = get_dwi_value("dwi1")
+
+            if prev_dwi0 is None: prev_dwi0 = dwi0
+            if prev_dwi1 is None: prev_dwi1 = dwi1
+
+            # 5-SECOND STATUS UPDATE
+            if now - last_debug_print >= 5.0:
+                percent = get_acl_percent()
+                print(f"\n--- STATUS ({time.strftime('%H:%M:%S')}) ---")
+                
+                with state_lock:
+                    if door_start_time:
+                        rem = int(DOOR_DELAY_S - (now - door_start_time))
+                        print(f"Door Timer:  {max(0, rem)}s remaining (ACK: {taster3_flag})")
+                    else:
+                        print(f"Door Timer:  Inactive")
+
+                if acl2_start_time and not acl2_sms_sent:
+                    rem = int(ACL2_TIME_DELAY - (now - acl2_start_time))
+                    print(f"60% Timer:   {max(0, rem)}s until SMS")
+                elif acl1_start_time and not acl1_sms_sent:
+                    rem = int(ACL1_TIME_DELAY - (now - acl1_start_time))
+                    print(f"80% Timer:   {max(0, rem)}s until SMS")
+                else:
+                    print(f"Water Alert: Inactive")
+
+                print(f"Current ACL: {percent}%")
+                print(f"--------------------------")
+                last_debug_print = now
+
+            # Taster Check (Rising Edge)
+            if dwi1 and not prev_dwi1:
+                with state_lock:
+                    taster3_flag = True
+                print(">>> ACK RECEIVED <<<")
+
+            # Door Check (Falling Edge - Door Opens)
+            if prev_dwi0 and not dwi0:
+                schedule_door_timer()
+
+            # ACL Check every 1s
+            if now - last_acl_print >= 1.0:
+                percent = get_acl_percent()
+                if percent is not None:
+                    check_acl_alert(percent)
+                last_acl_print = now
+
+            # SMS Processing
+            # We check the flag, then immediately clear it before the loop.
+            should_send = False
+            with state_lock:
+                if send_sms_door:
+                    should_send = True
+                    send_sms_door = False
+
+            if should_send:
+                print(f"[ALARM] Sending notifications to {len(NUMBERS)} recipients...")
+                for num in NUMBERS:
+                    send_sms(num, "Alarm: Die Tuer beim Reservoir Ungericht wurde geoeffnet ohne zu quittieren")
+
+            prev_dwi0, prev_dwi1 = dwi0, dwi1
+            time.sleep(POLL_INTERVAL_S)
+
+    except KeyboardInterrupt:
+        print("\nExit.")
+    finally:
+        with state_lock:
+            if door_timer: door_timer.cancel()
+
+if __name__ == "__main__":
+    main()
